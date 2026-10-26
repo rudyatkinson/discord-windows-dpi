@@ -3,7 +3,7 @@
   Discord DPI for Windows - installer
 
   Usage (PowerShell, no admin needed):
-    irm https://raw.githubusercontent.com/bilal-arvis/discord-windows-dpi/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/rudyatkinson/discord-windows-dpi/main/install.ps1 | iex
 
   Re-run the same line to update. Set $env:DISCORD_DPI_LANG = 'tr' or 'en' to force the language.
   Windows counterpart of https://github.com/rudyatkinson/discord-macos-dpi
@@ -13,7 +13,7 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # ---------------------------------------------------------------- constants
 
-$Repo    = 'bilal-arvis/discord-windows-dpi'
+$Repo    = 'rudyatkinson/discord-windows-dpi'
 $Branch  = 'main'
 $RawBase = "https://raw.githubusercontent.com/$Repo/$Branch"
 if ($env:DISCORD_DPI_SOURCE) { $RawBase = $env:DISCORD_DPI_SOURCE.TrimEnd('/') }   # testing: serve the repo locally

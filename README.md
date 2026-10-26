@@ -15,7 +15,7 @@ A small installer that routes **only Discord's traffic** through a local DPI-byp
 Open PowerShell (no admin needed) and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/bilal-arvis/discord-windows-dpi/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/rudyatkinson/discord-windows-dpi/main/install.ps1 | iex
 ```
 
 Takes about a minute, asks for no password, downloads Discord if it is not installed. **To update, run the same line again.**
@@ -96,7 +96,7 @@ Strategies are ByeDPI argument groups, tried in order. They live in the `$Script
 PowerShell açın (yönetici gerekmez) ve çalıştırın:
 
 ```powershell
-irm https://raw.githubusercontent.com/bilal-arvis/discord-windows-dpi/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/rudyatkinson/discord-windows-dpi/main/install.ps1 | iex
 ```
 
 Yaklaşık bir dakika sürer, şifre istemez, Discord kurulu değilse indirir. **Güncellemek için aynı satırı tekrar çalıştırın.**
