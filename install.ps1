@@ -18,7 +18,7 @@ $Branch  = 'main'
 $RawBase = "https://raw.githubusercontent.com/$Repo/$Branch"
 if ($env:DISCORD_DPI_SOURCE) { $RawBase = $env:DISCORD_DPI_SOURCE.TrimEnd('/') }   # testing: serve the repo locally
 
-$Version   = '1.0.0'
+$Version   = '1.1.0'
 $ByeTag    = 'v0.17.3'
 $ByeZip    = 'byedpi-17.3-x86_64-w64.zip'
 $ByeUrl    = "https://github.com/hufrea/byedpi/releases/download/$ByeTag/$ByeZip"
@@ -52,6 +52,7 @@ $M = @{
         discord_dl    = 'Discord is not installed; downloading the official installer...'
         discord_inst  = 'Installing Discord (a Discord window will open; you can close it)...'
         discord_fail  = 'Discord could not be installed. Install it from https://discord.com/download and re-run this command.'
+        conflict      = 'A system-wide DPI bypass is already running ({0}). This tool works alongside it but is redundant; pick one of the two.'
         stop_old      = 'Stopping the previous Discord DPI service...'
         bye_dl        = 'Downloading ByeDPI {0}...'
         bye_sha_bad   = 'ByeDPI download is corrupt (SHA256 mismatch). Aborting.'
@@ -81,6 +82,7 @@ $M = @{
         discord_dl    = 'Discord kurulu değil; resmi kurulum dosyası indiriliyor...'
         discord_inst  = 'Discord kuruluyor (bir Discord penceresi açılacak; kapatabilirsiniz)...'
         discord_fail  = 'Discord kurulamadı. https://discord.com/download adresinden kurup bu komutu tekrar çalıştırın.'
+        conflict      = 'Sistem geneli bir DPI bypass zaten çalışıyor ({0}). Bu araç onunla birlikte çalışır ama gereksizdir; ikisinden birini seçin.'
         stop_old      = 'Önceki Discord DPI servisi durduruluyor...'
         bye_dl        = 'ByeDPI {0} indiriliyor...'
         bye_sha_bad   = 'ByeDPI indirmesi bozuk (SHA256 uyuşmuyor). İptal edildi.'
@@ -149,6 +151,17 @@ else {
     if (-not (Test-Path $UpdateExe)) { Fail 'discord_fail' }
     Say 'discord_ok' 'Green'
 }
+
+# ---------------------------------------------------------------- 2b. system-wide DPI tools already running? (warn only)
+
+function Get-ConflictingTools {
+    $names = @()
+    try { $names += @(Get-Service -ErrorAction Stop | Where-Object { $_.Status -eq 'Running' -and $_.Name -match 'goodbyedpi|zapret|winws' } | ForEach-Object { "$($_.Name) (service)" }) } catch { }
+    $names += @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(goodbyedpi|winws)$' } | ForEach-Object { "$($_.ProcessName).exe" } | Select-Object -Unique)
+    return @($names | Select-Object -Unique)
+}
+$conflicts = Get-ConflictingTools
+if ($conflicts.Count) { Say 'conflict' 'Yellow' ($conflicts -join ', ') }
 
 # ---------------------------------------------------------------- 3. stop previous install (so files can be replaced)
 
@@ -224,8 +237,9 @@ $code = '000'
 for ($attempt = 1; $attempt -le 3 -and $code -eq '000'; $attempt++) {
     if ($attempt -gt 1) { Start-Sleep 3 }
     if (-not (Test-PortOpen $Port)) { continue }
-    $out = & $Curl --ssl-no-revoke -s -o NUL -m 10 -x "socks5h://127.0.0.1:$Port" -w '%{http_code}' 'https://discord.com/api/v9/gateway' 2>$null
-    if ("$out".Trim()) { $code = "$out".Trim() }
+    # The service script probes with DoH-resolved IPs, so poisoned system DNS does not skew the result.
+    $out = & $PS51 -NoProfile -ExecutionPolicy Bypass -File $ScriptDest probe 2>$null | Where-Object { $_ -is [string] -and $_ -match '^\d{3}$' } | Select-Object -Last 1
+    if ($out) { $code = "$out" }
 }
 if ($code -eq '200') { Say 'verify_ok' 'Green' $code } else { Say 'verify_bad' 'Yellow' $code }
 

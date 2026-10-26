@@ -25,7 +25,8 @@ The installer follows your Windows language. To force one: `$env:DISCORD_DPI_LAN
 ### How it works
 
 - **Local proxy.** [ByeDPI](https://github.com/hufrea/byedpi) (`ciadpi.exe`) listens only on `127.0.0.1:8881`. System proxy settings are not changed.
-- **Launch flag.** Only a Discord started with `--proxy-server=socks5://127.0.0.1:8881` uses the proxy. Nothing in Discord's files is patched.
+- **Launch flag.** Only a Discord started with `--proxy-server=socks4://127.0.0.1:8881` uses the proxy. Nothing in Discord's files is patched.
+- **DNS.** ISPs that block Discord usually also poison DNS (every Discord name resolves to the block server). The service resolves the Discord zones over DNS-over-HTTPS (Cloudflare, then Google) and passes the real IPs to Discord with `--host-resolver-rules`. Its own connectivity probes use the same IPs.
 - **Watchdog task.** A per-user Scheduled Task named `DiscordDPI` starts at logon and
   - keeps the proxy running;
   - relaunches Discord through the proxy if it was started without it (Start Menu, "open at login", or a restart after an update);
@@ -68,8 +69,8 @@ Uninstall removes everything except Discord itself.
 
 ### Limitations
 
-- **Voice channels** use UDP, which does not go through the proxy. They work only if UDP is not blocked; this tool does not fix UDP blocking.
-- **Discord's own updater** (`Update.exe`) does not use the proxy. If update downloads are blocked, install the new version manually from discord.com.
+- **Voice channels** use UDP, which does not go through the proxy. Verified working on Türk Telekom (the voice signalling WebSocket is proxied, the UDP media is not blocked there). On a network that blocks UDP they will not work; this tool does not fix UDP blocking.
+- **Discord's own updater** does not use Chromium, so it sees neither the proxy nor the DNS rules and would retry on the "Discord Updater" splash forever on a blocked network. While installed, the service sets `DESKTOP_TTI_UPDATE_CHECK_DEADLINE_MS` (15 s) in Discord's `settings.json`, which makes Discord give up on the update check and start the installed version (restored on uninstall). Discord starts about 15 s slower and will not auto-update while blocked; install new versions manually from discord.com when needed.
 - **"Open Discord on startup"** launches Discord without the proxy at logon; the watchdog closes it and relaunches it through the proxy within a few seconds. You will see Discord open twice. Turn the setting off in Discord if that bothers you.
 - **Windows Defender / SmartScreen** may flag `ciadpi.exe` (common for DPI tools). Adding an exclusion needs admin rights, so the installer does not do it. If the proxy never starts, check Windows Security → Protection history.
 - **Windows on ARM** has no native ByeDPI build; the x64 build runs under emulation and is untested.
@@ -106,7 +107,8 @@ Kurulumcu Windows dilinizi izler. Zorlamak için komuttan önce: `$env:DISCORD_D
 ### Nasıl çalışır
 
 - **Yerel proxy.** [ByeDPI](https://github.com/hufrea/byedpi) (`ciadpi.exe`) sadece `127.0.0.1:8881` adresini dinler. Sistem proxy ayarları değişmez.
-- **Başlatma bayrağı.** Sadece `--proxy-server=socks5://127.0.0.1:8881` ile başlatılan Discord proxy'yi kullanır. Discord'un dosyalarına dokunulmaz.
+- **Başlatma bayrağı.** Sadece `--proxy-server=socks4://127.0.0.1:8881` ile başlatılan Discord proxy'yi kullanır. Discord'un dosyalarına dokunulmaz.
+- **DNS.** Discord'u engelleyen İSS'ler genelde DNS'i de zehirler (her Discord adı engel sunucusuna çözülür). Servis, Discord bölgelerini DNS-over-HTTPS (önce Cloudflare, sonra Google) ile çözer ve gerçek IP'leri `--host-resolver-rules` ile Discord'a verir. Kendi bağlantı testleri de aynı IP'leri kullanır.
 - **Watchdog görevi.** `DiscordDPI` adlı kullanıcı seviyesinde bir Zamanlanmış Görev oturum açılışında başlar ve
   - proxy'yi ayakta tutar;
   - proxy'siz açılan Discord'u (Başlat Menüsü, "açılışta başlat" veya güncelleme sonrası yeniden başlatma) proxy üzerinden yeniden açar;
@@ -149,8 +151,8 @@ Kaldırma, Discord'un kendisi hariç her şeyi siler.
 
 ### Sınırlamalar
 
-- **Ses kanalları** UDP kullanır, proxy'den geçmez. UDP engellenmemişse çalışır; bu araç UDP engelini çözmez.
-- **Discord'un kendi güncelleyicisi** (`Update.exe`) proxy'yi kullanmaz. Güncelleme indirmesi engelleniyorsa yeni sürümü discord.com'dan elle kurun.
+- **Ses kanalları** UDP kullanır, proxy'den geçmez. Türk Telekom'da çalıştığı doğrulandı (ses sinyalleşme WebSocket'i proxy'den geçer, UDP medya orada engelli değil). UDP'yi engelleyen bir ağda çalışmaz; bu araç UDP engelini çözmez.
+- **Discord'un kendi güncelleyicisi** Chromium kullanmaz; proxy'yi de DNS kurallarını da görmez ve engelli ağda "Discord Updater" ekranında sonsuza kadar yeniden dener. Araç kuruluyken Discord'un `settings.json` dosyasına `DESKTOP_TTI_UPDATE_CHECK_DEADLINE_MS` (15 sn) yazılır; Discord bu süre sonunda güncelleme kontrolünden vazgeçip kurulu sürümü başlatır (kaldırmada geri alınır). Discord yaklaşık 15 sn geç açılır ve engelliyken otomatik güncellenmez; gerektiğinde yeni sürümü discord.com'dan elle kurun.
 - **"Discord'u açılışta başlat"** ayarı oturum açılışında Discord'u proxy'siz başlatır; watchdog birkaç saniye içinde kapatıp proxy üzerinden yeniden açar. Discord'un iki kez açıldığını görürsünüz. Rahatsız ediyorsa ayarı Discord'dan kapatın.
 - **Windows Defender / SmartScreen** `ciadpi.exe`'yi işaretleyebilir (DPI araçlarında yaygın). Dışlama eklemek yönetici hakkı ister, bu yüzden kurulumcu bunu yapmaz. Proxy hiç başlamıyorsa Windows Güvenliği → Koruma geçmişine bakın.
 - **ARM Windows** için ByeDPI'nin yerel build'i yok; x64 build emülasyonla çalışır, test edilmedi.

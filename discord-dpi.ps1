@@ -19,7 +19,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('watch', 'status', 'repair', 'diagnose', 'uninstall', 'launch', 'pick-strategy', 'setup', 'stop')]
+    [ValidateSet('watch', 'status', 'repair', 'diagnose', 'uninstall', 'launch', 'pick-strategy', 'setup', 'stop', 'probe')]
     [string]$Command = 'status',
     [switch]$Pause,
     [switch]$Force
@@ -30,7 +30,7 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # ---------------------------------------------------------------- constants
 
-$Script:Version      = '1.0.0'
+$Script:Version      = '1.1.0'
 $Script:Root         = Join-Path $env:LOCALAPPDATA 'DiscordDPI'
 $Script:Bin          = Join-Path $Script:Root 'bin\ciadpi.exe'
 $Script:ScriptPath   = Join-Path $Script:Root 'discord-dpi.ps1'
@@ -46,8 +46,38 @@ $Script:WatchPidFile = Join-Path $Script:Root 'watch.pid'
 $Script:Port      = 8881
 $Script:TestPort  = 8882
 $Script:DiagPort  = 8883
-$Script:Proxy     = "socks5://127.0.0.1:$($Script:Port)"
+# socks4 (not socks5): with SOCKS4 Chromium resolves hostnames itself, which lets --host-resolver-rules
+# feed it DoH-resolved IPs. ISPs that poison DNS (e.g. Türk Telekom -> 195.175.254.2) would otherwise
+# make ciadpi connect to the block server, and no desync can fix that.
+$Script:Proxy     = "socks4://127.0.0.1:$($Script:Port)"
 $Script:ProxyFlag = "--proxy-server=$($Script:Proxy)"
+$Script:HostsFile = Join-Path $Script:Root 'hosts.json'
+# Discord's native updater (the "Discord Updater" splash) does not use Chromium, so it sees neither the
+# proxy nor the DoH rules and retries the manifest fetch forever on a blocked network. Discord's bootstrap
+# has a "fail open" path: with DESKTOP_TTI_UPDATE_CHECK_DEADLINE_MS > 0 in settings.json it gives up after
+# that many ms and starts the installed version. We set it while installed and restore it on uninstall.
+$Script:DiscordSettings = Join-Path $env:APPDATA 'discord\settings.json'
+$Script:SettingsBackup  = Join-Path $Script:Root 'discord-settings-backup.json'
+$Script:SettingsOverride = [ordered]@{
+    'DESKTOP_TTI_UPDATE_CHECK_DEADLINE_MS' = 15000
+}
+
+# DNS zones that get mapped. Key = zone, value = a hostname in that zone to resolve over DoH.
+$Script:Zones = [ordered]@{
+    'discord.com'    = 'discord.com'
+    'discord.gg'     = 'gateway.discord.gg'
+    'discordapp.com' = 'cdn.discordapp.com'
+}
+# Last resort if every DoH provider is unreachable and there is no cached answer (Cloudflare anycast, 2026-10).
+$Script:DefaultZoneIps = @{
+    'discord.com'    = '162.159.128.233'
+    'discord.gg'     = '162.159.130.234'
+    'discordapp.com' = '162.159.134.233'
+}
+$Script:DohProviders = @(
+    'https://cloudflare-dns.com/dns-query?type=A&name='
+    'https://dns.google/resolve?type=A&name='
+)
 $Script:TaskName  = 'DiscordDPI'
 $Script:MenuDir   = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Discord DPI'
 $Script:DiscordDir = Join-Path $env:LOCALAPPDATA 'Discord'
@@ -56,20 +86,22 @@ $Script:Curl      = Join-Path $env:SystemRoot 'System32\curl.exe'
 $Script:Hosts = @('discord.com/api/v9/gateway', 'gateway.discord.gg', 'cdn.discordapp.com')
 
 # Tried in order; the first one that reaches every host wins.
-# ByeDPI's README recommends the first two on Windows. "--fake" can be unstable
-# on Windows, so fake-based strategies come later. Add new ones as new lines.
+# Order comes from testing against a live SNI-based block (Türk Telekom / BTK, 2026-10): tlsrec, fake
+# and oob passed, plain split/disorder did not. tlsrec first because it does not depend on the
+# hop count to the DPI box the way --ttl does. Add new ones as new lines.
 # Avoid "--split 1" (no +s) and "--fake-tls-mod rand": both broke working hosts on Windows in testing.
 $Script:Strategies = @(
+    '--tlsrec 1+s'
+    '--oob 1'
+    '--split 1+s --tlsrec 3+s'
+    '--fake -1 --ttl 5'
+    '--fake -1 --ttl 8'
+    '--fake -1 --ttl 3'
+    '--disoob 1'
+    '--tlsrec 1+s --disorder 1+s'
+    '--fake -1 --ttl 5 --tlsrec 1+s'
     '--split 1+s --disorder 3+s'
     '--disorder 1 --fake -1'
-    '--disorder 1'
-    '--split 1+s'
-    '--tlsrec 1+s'
-    '--split 1+s --tlsrec 3+s'
-    '--fake -1 --ttl 8'
-    '--fake -1 --ttl 5'
-    '--oob 1'
-    '--disoob 1'
     '--disorder 1 --auto=torst --tlsrec 1+s'
 )
 
@@ -238,7 +270,13 @@ function Test-Online {
 function Get-HttpCode([int]$port, [string]$h, [int]$timeout) {
     # --ssl-no-revoke: Windows curl (Schannel) otherwise fails with CRYPT_E_REVOCATION_OFFLINE when the
     # OCSP/CRL servers are unreachable, which looks exactly like a block. Chain validation stays on.
-    $out = & $Script:Curl --ssl-no-revoke -s -o NUL -m $timeout -x "socks5h://127.0.0.1:$port" -w '%{http_code}' "https://$h" 2>$null
+    # socks5 (not socks5h) + --resolve: curl hands ciadpi the DoH-resolved IP, exactly like Discord does
+    # via socks4 + --host-resolver-rules. This keeps poisoned system DNS out of the probe.
+    $hostOnly = ($h -split '/')[0]
+    $extra = @()
+    $ip = Get-ZoneIp $hostOnly
+    if ($ip) { $extra = @('--resolve', "${hostOnly}:443:$ip") }
+    $out = & $Script:Curl --ssl-no-revoke -s -o NUL -m $timeout @extra -x "socks5://127.0.0.1:$port" -w '%{http_code}' "https://$h" 2>$null
     $code = "$out".Trim()
     if (-not $code) { $code = '000' }
     return $code
@@ -256,6 +294,77 @@ function Get-NetSignature {
         }
         return ($parts -join ';')
     } catch { return '' }
+}
+
+# System-wide DPI tools (WinDivert based) that make this tool redundant. Same logic as install.ps1.
+function Get-ConflictingTools {
+    $names = @()
+    try { $names += @(Get-Service -ErrorAction Stop | Where-Object { $_.Status -eq 'Running' -and $_.Name -match 'goodbyedpi|zapret|winws' } | ForEach-Object { "$($_.Name) (service)" }) } catch { }
+    $names += @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^(goodbyedpi|winws)$' } | ForEach-Object { "$($_.ProcessName).exe" } | Select-Object -Unique)
+    return @($names | Select-Object -Unique)
+}
+
+# ---------------------------------------------------------------- DNS (DoH)
+
+$Script:ZoneIps = @{}
+$Script:ZoneIpsTime = [datetime]::MinValue
+
+function Get-ZoneOf([string]$hostname) {
+    $h = $hostname.ToLower()
+    foreach ($z in $Script:Zones.Keys) { if ($h -eq $z -or $h.EndsWith(".$z")) { return $z } }
+    return $null
+}
+
+# A records over DoH (JSON API). Returns a sorted string[] or @().
+function Resolve-Doh([string]$name) {
+    foreach ($base in $Script:DohProviders) {
+        try {
+            $raw = & $Script:Curl --ssl-no-revoke -s -m 6 -H 'accept: application/dns-json' "$base$name" 2>$null
+            if (-not $raw) { continue }
+            $j = "$raw" | ConvertFrom-Json
+            $ips = @($j.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { "$($_.data)" } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' })
+            if ($ips.Count) { return ($ips | Sort-Object { [version]$_ }) }
+        } catch { }
+    }
+    return @()
+}
+
+# Resolves every zone once per 10 minutes. Keeps the previous IP while it is still in the answer set
+# (Cloudflare rotates answer order), so Discord is not relaunched for nothing.
+function Update-ZoneIps([switch]$ForceRefresh) {
+    if (-not $ForceRefresh -and ((Get-Date) - $Script:ZoneIpsTime).TotalSeconds -lt 600 -and $Script:ZoneIps.Count) { return }
+    if (-not $Script:ZoneIps.Count -and (Test-Path $Script:HostsFile)) {
+        try { $saved = Get-Content $Script:HostsFile -Raw | ConvertFrom-Json; foreach ($p in $saved.PSObject.Properties) { $Script:ZoneIps[$p.Name] = "$($p.Value)" } } catch { }
+    }
+    $changed = $false
+    foreach ($z in $Script:Zones.Keys) {
+        $ips = Resolve-Doh $Script:Zones[$z]
+        if ($ips.Count) {
+            $cur = $Script:ZoneIps[$z]
+            if (-not $cur -or ($ips -notcontains $cur)) { $Script:ZoneIps[$z] = $ips[0]; $changed = $true }
+        } elseif (-not $Script:ZoneIps[$z]) {
+            $Script:ZoneIps[$z] = $Script:DefaultZoneIps[$z]; $changed = $true
+        }
+    }
+    $Script:ZoneIpsTime = Get-Date
+    if ($changed) {
+        try { Ensure-Dirs; ($Script:ZoneIps | ConvertTo-Json -Compress) | Set-Content $Script:HostsFile -Encoding ASCII } catch { }
+        Log "zone ips: $(($Script:Zones.Keys | ForEach-Object { "$_=$($Script:ZoneIps[$_])" }) -join ' ')"
+    }
+}
+
+function Get-ZoneIp([string]$hostname) {
+    Update-ZoneIps
+    $z = Get-ZoneOf $hostname
+    if ($z) { return $Script:ZoneIps[$z] }
+    return $null
+}
+
+# Chromium --host-resolver-rules value for the proxied Discord.
+function Get-HostRules {
+    Update-ZoneIps
+    $rules = foreach ($z in $Script:Zones.Keys) { "MAP *.$z $($Script:ZoneIps[$z]), MAP $z $($Script:ZoneIps[$z])" }
+    return ($rules -join ', ')
 }
 
 # ---------------------------------------------------------------- strategy
@@ -377,10 +486,13 @@ function Get-DiscordState {
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='Discord.exe'" -ErrorAction SilentlyContinue)
     $proxied = @($procs | Where-Object { $_.CommandLine -like "*$($Script:ProxyFlag)*" })
     $minimized = @($procs | Where-Object { $_.CommandLine -like '*--start-minimized*' })
+    $rules = ''
+    foreach ($p in $proxied) { if ("$($p.CommandLine)" -match '--host-resolver-rules="([^"]*)"') { $rules = $Matches[1]; break } }
     return [pscustomobject]@{
         Running   = ($procs.Count -gt 0)
         HasProxy  = ($proxied.Count -gt 0)
         Minimized = ($minimized.Count -gt 0)
+        Rules     = $rules
     }
 }
 
@@ -402,10 +514,51 @@ function Get-DiscordExe {
     return $null
 }
 
+# $enable = $true: apply $Script:SettingsOverride to Discord's settings.json (backing up originals once).
+# $enable = $false: restore the backed-up values (key removed if it did not exist before).
+function Set-DiscordUpdateSkip([bool]$enable) {
+    try {
+        if (-not (Test-Path $Script:DiscordSettings)) { return }
+        $json = Get-Content $Script:DiscordSettings -Raw -ErrorAction Stop
+        $obj = $json | ConvertFrom-Json
+        $keys = @($Script:SettingsOverride.Keys)
+        if ($enable) {
+            if (-not (Test-Path $Script:SettingsBackup)) {
+                $bk = @{}
+                foreach ($k in $keys) { if ($obj.PSObject.Properties[$k]) { $bk[$k] = $obj.$k } else { $bk[$k] = $null } }
+                Ensure-Dirs
+                ($bk | ConvertTo-Json -Compress) | Set-Content $Script:SettingsBackup -Encoding ASCII
+            }
+            $dirty = $false
+            foreach ($k in $keys) {
+                $want = $Script:SettingsOverride[$k]
+                if (-not $obj.PSObject.Properties[$k] -or "$($obj.$k)" -ne "$want") { $obj | Add-Member -NotePropertyName $k -NotePropertyValue $want -Force; $dirty = $true }
+            }
+            if (-not $dirty) { return }
+        } else {
+            if (-not (Test-Path $Script:SettingsBackup)) { return }
+            $bk = Get-Content $Script:SettingsBackup -Raw | ConvertFrom-Json
+            foreach ($k in $keys) {
+                $orig = $bk.$k
+                if ($null -eq $orig) { if ($obj.PSObject.Properties[$k]) { $obj.PSObject.Properties.Remove($k) } }
+                else { $obj | Add-Member -NotePropertyName $k -NotePropertyValue $orig -Force }
+            }
+        }
+        $out = $obj | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($Script:DiscordSettings, $out, (New-Object System.Text.UTF8Encoding($false)))
+        Log "discord settings override applied = $enable"
+    } catch { Log "discord settings edit failed: $_" }
+}
+
 # $extra: additional Discord flags (e.g. --start-minimized).
 function Start-Discord([string[]]$extra = @(), [switch]$NoProxy) {
     $flags = @()
-    if (-not $NoProxy) { $flags += $Script:ProxyFlag }
+    if (-not $NoProxy) {
+        Set-DiscordUpdateSkip $true
+        $flags += $Script:ProxyFlag
+        # Quoted by hand: Start-Process joins the list with spaces and does not quote elements.
+        $flags += "--host-resolver-rules=""$(Get-HostRules)"""
+    }
     $flags += $extra
     $update = Join-Path $Script:DiscordDir 'Update.exe'
     $exe = Get-DiscordExe
@@ -450,6 +603,7 @@ function Invoke-HealthCheck([switch]$Forced) {
     if (-not $Forced -and ((Get-Date) - $Script:LastPick).TotalSeconds -lt 300) { return $false }
 
     Log 'discord unreachable through proxy; re-picking strategy'
+    Update-ZoneIps -ForceRefresh
     $old = Get-CurrentStrategy
     $new = Select-Strategy -port $Script:TestPort -Quiet
     $Script:LastPick = Get-Date
@@ -511,10 +665,12 @@ function Invoke-Watch {
                 $nextCheck = (Get-Date).AddSeconds($interval)
             }
 
-            # 5. discord running without the proxy -> relaunch
-            if ($st.Running -and -not $st.HasProxy) {
+            # 5. discord running without the proxy (or with stale DNS rules) -> relaunch
+            $staleRules = $false
+            if ($st.HasProxy -and $Script:ZoneIps.Count) { $staleRules = ($st.Rules -ne (Get-HostRules)) }
+            if ($st.Running -and (-not $st.HasProxy -or $staleRules)) {
                 if ($now -ge $backoffUntil) {
-                    Log 'discord running without proxy -> relaunch'
+                    if ($staleRules) { Log 'discord DNS rules outdated -> relaunch' } else { Log 'discord running without proxy -> relaunch' }
                     if (Restart-DiscordProxied) {
                         Start-Sleep 5
                         if ((Get-DiscordState).HasProxy) { $relaunchFails = 0; Log 'discord relaunched through proxy' } else { $relaunchFails++ }
@@ -652,6 +808,7 @@ function Invoke-Diagnose {
     $owner = Get-PortOwner $Script:Port
     $portBusy = ($null -ne $owner) -and ($owner.ProcessName -ne 'ciadpi')
     $current = Get-CurrentStrategy
+    $conflicts = Get-ConflictingTools
     $live = $false
     if ($owner -and -not $portBusy) { $live = Test-Probe }
 
@@ -697,6 +854,7 @@ function Invoke-Diagnose {
         "Live proxy reaches Discord : $live"
         "Any strategy works  : $anyWorks"
         "Discord             : $((Get-DiscordState) | ConvertTo-Json -Compress)"
+        "Other DPI tools running : $(if ($conflicts.Count) { $conflicts -join ', ' } else { 'none' })"
     )
     $sum | Set-Content (Join-Path $work 'summary.txt') -Encoding UTF8
 
@@ -705,12 +863,22 @@ function Invoke-Diagnose {
     $org = & $Script:Curl -s -m 5 'https://ipinfo.io/org' 2>$null
     $net += "ISP/org: $org"
     $net += ''
+    $poisoned = $false
     foreach ($h in @('discord.com', 'gateway.discord.gg', 'cdn.discordapp.com')) {
-        try {
-            $a = (Resolve-DnsName $h -Type A -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) -join ', '
-            $net += "DNS $h -> $a"
-        } catch { $net += "DNS $h -> FAILED ($_)" }
+        $sys = ''
+        try { $sys = (Resolve-DnsName $h -Type A -DnsOnly -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) -join ', ' }
+        catch { $sys = "FAILED ($_)" }
+        $doh = (Resolve-Doh $h) -join ', '
+        $net += "DNS $h"
+        $net += "    system : $sys"
+        $net += "    DoH    : $doh"
+        if ($doh -and $sys -and $sys -notlike 'FAILED*') {
+            $sysSet = $sys -split ', '; $dohSet = $doh -split ', '
+            if (-not ($sysSet | Where-Object { $dohSet -contains $_ })) { $poisoned = $true }
+        }
     }
+    $net += "DNS poisoning suspected (system answers share nothing with DoH): $poisoned"
+    $net += "Zone IPs in use: $(($Script:Zones.Keys | ForEach-Object { "$_=$($Script:ZoneIps[$_])" }) -join ' ')"
     $net += ''
     $net += 'Adapters (up):'
     $adapters = @()
@@ -763,9 +931,10 @@ function Invoke-Uninstall {
     try { Unregister-ScheduledTask -TaskName $Script:TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
     Stop-Proxy
     $st = Get-DiscordState
+    if ($st.Running -and $st.HasProxy) { Stop-Discord | Out-Null }
+    Set-DiscordUpdateSkip $false
     if ($st.Running -and $st.HasProxy) {
         $extra = @(); if ($st.Minimized) { $extra += '--start-minimized' }
-        Stop-Discord | Out-Null
         Start-Discord -extra $extra -NoProxy | Out-Null
     }
     Remove-Item $Script:MenuDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -784,6 +953,7 @@ switch ($Command) {
     'uninstall'     { Invoke-Uninstall }
     'launch'        { if (Restart-DiscordProxied) { Write-Host (T 'launch_done') } else { Write-Host (T 'launch_fail') -ForegroundColor Red } }
     'pick-strategy' { $s = Select-Strategy; if ($s) { Write-Output $s } else { exit 2 } }
+    'probe'         { $c = Get-HttpCode -port $Script:Port -h $Script:Hosts[0] -timeout 10; Write-Output $c; if ($c -ne '200') { exit 1 } }
     'setup'         { Install-Task; Install-Shortcuts; Write-Host (T 'setup_done') }
     'stop'          { Stop-Task; Stop-Proxy }
 }
